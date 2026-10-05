@@ -1,0 +1,22 @@
+# Top-level dependencies (human-edited). Exact pins live in requirements.lock.txt.
+# Core numerics / data
+numpy
+pandas
+scipy
+# Forecasting (frozen model: quantile LightGBM; sklearn for baselines/metrics)
+lightgbm
+scikit-learn
+# Config (parameter freeze lives in YAML)
+pyyaml
+# Iranian calendar: Solar Hijri (Nowruz etc.) + lunar Hijri (Ramadan, Ashura...)
+jdatetime
+hijridate
+# Testing: unit + property-based tests for shield invariants
+pytest
+hypothesis
+# Plots + offline operator dashboard
+matplotlib
+plotly
+streamlit
+# Exploration
+jupyterlab
