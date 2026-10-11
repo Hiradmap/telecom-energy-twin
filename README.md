@@ -28,35 +28,71 @@ The MVP completely removes speculative "AI control" from safety-critical hardwar
 
 ```text
 .
-├── docs/               # Master architecture reports & documentation
-│   └── Architecture_v3.3.txt  # The implementation-ready blueprint
-├── src/                # Core implementation (Forecaster, Arbiter, Loop) - TO BE BUILT
-├── tests/              # Verification suites and property tests
-│   ├── verify_twin.py  # Validation script for physics & invariant tests
-│   └── reference/      # Mathematical core (twin_ref.py)
-├── data/               # Synthetic datasets & logs
-├── archive/            # Previous iterations and draft files
-├── requirements.txt    # Top-level Python dependencies
-├── wheelhouse/         # Offline package mirror
-└── README.md           # You are here
+├── docs/                      # Master architecture reports & blueprints
+│   ├── Architecture_v3.3.txt  # Implementation-ready engineering blueprint
+│   └── Production_Roadmap.md  # Telco-grade production scale-out architecture
+├── src/                       # Core implementation
+│   ├── controller.py          # Main digital-twin event loop & physics engine
+│   ├── forecaster.py          # Quantile LightGBM forecaster (q95)
+│   ├── grid_client.py         # Dual-mode Bargh-e Man (SAAPA) adapter
+│   ├── thermal.py             # Coupled shelter & battery thermal dynamics
+│   ├── data_generator.py      # Tavanir 2-hr timetable & archetype data generator
+│   └── dashboard.py           # Interactive Streamlit UI dashboard
+├── tests/                     # Comprehensive verification suites (61 tests)
+│   ├── test_physics_controller.py # Controller accuracy & physics tests
+│   ├── test_thermal.py        # Shelter & battery thermal dynamics tests
+│   ├── test_grid_client.py    # Bargh-e Man SAAPA client & schedule tests
+│   ├── test_dataset.py        # Dataset consistency & archetype checks
+│   ├── test_dashboard.py      # Streamlit scenario & accounting tests
+│   ├── test_invariants.py     # Hypothesis property tests across 2,000 states
+│   ├── arbiter_invariants.py  # Priority lattice invariant checker
+│   ├── verify_twin.py         # Multi-stage verification script
+│   └── reference/twin_ref.py  # Reference mathematical physics engine
+├── data/                      # Synthetic telemetry data (90 days, 3 archetypes)
+├── models/                    # Serialized Quantile LightGBM booster weights
+├── requirements.txt           # Top-level Python dependencies
+└── README.md                  # System overview and quickstart guide
+```
+
+---
+
+## 🚀 Quickstart & One-Line Commands
+
+All commands run directly using the pre-configured local virtual environment (`.venv`):
+
+### 1. Run the Physical Digital Twin Simulation
+Executes the physical simulation loop against out-of-sample data with 0.96 rectifier efficiency, wake latency, and thermal tracking:
+```bash
+.venv/bin/python src/controller.py
+```
+
+### 2. Launch the Interactive Visual Dashboard
+Launches the full Streamlit UI with scenario sliders for Battery SOH (25%–100%), Outage Duration (1–4h), Carrier Wake Latency (0, 5, 15 min), and interactive Plotly curves:
+```bash
+.venv/bin/streamlit run src/dashboard.py
+```
+
+### 3. Run the Comprehensive Verification Test Suite
+Runs all 61 automated unit, invariant, and property tests:
+```bash
+.venv/bin/pytest tests -v
+```
+
+### 4. Regenerate Synthetic Telecom Data
+Regenerates realistic 5-minute telemetry with 2-hour Tavanir timetable blocks and 3 distinct site archetypes:
+```bash
+.venv/bin/python src/data_generator.py --days 90 --sites 3
 ```
 
 ---
 
 ## ⚙️ Environment Setup
 
-This project is built for **Python 3.14** and is **fully offline-capable** to protect against connectivity loss during development.
+This project is built for **Python 3.14** and is **fully offline-capable** to guarantee zero reliance on external network calls during evaluation or competition judging.
 
-### Setup (Online)
+### Setup
 ```bash
 python3 -m venv .venv
 .venv/bin/pip install -r requirements.lock.txt
 ```
 
-### Setup (Offline, from the bundled mirror)
-```bash
-python3 -m venv .venv
-.venv/bin/pip install --no-index --find-links wheelhouse -r requirements.lock.txt
-```
-
-*Note: Always run code using `.venv/bin/python` or by activating the environment (`source .venv/bin/activate`).*

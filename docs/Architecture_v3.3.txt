@@ -553,10 +553,12 @@ Interpretation:
 The forecaster's true value is QoS-safe energy savings when hardware wake-up is slow, NOT simply squeezing out more kWh. When wake latency is 15 minutes, reactive control experiences 79 severe congestion steps, while forecast+shield suffers only 12. Because injected traffic spikes are random, no forecaster can predict 100% of them; a baseline rate of ~12 violations is irreducible.
 
 ================================================================================
-11. Parameter Freeze v3.2
+11. Parameter Freeze v3.3
 ================================================================================
 
 All parameters below are frozen for implementation unless marked as a sensitivity sweep.
+Updated in v3.3: SOC_CRIT aligned to 0.15 hard floor, Rectifier efficiency = 0.96, Carrier wake signaling tax = 0.085 kW.
+
 
 | Parameter | Frozen Value | Tag | Engineering Rationale / Source |
 |:---|---:|:---:|:---|
@@ -825,3 +827,24 @@ Pitch: "We don't force you to drop QoS; we give you ultimate control. Our Priori
 Challenge: The simulator uses clean physics (Peukert's law), but real aged VRLA batteries sulfate and suddenly drop voltage, completely ignoring capacity estimates.
 Pitch: "Our MVP proves the logic and the safety shield work perfectly on standard physics. However, your batteries have aged uniquely in the field. To catch these 'sudden death' events, we need to launch a Pilot Program. Give us 6 months of your historical Battery Management System (BMS) telemetry, and we will train a custom AI anomaly detector specifically for your hardware."
 Result: This turns a mathematical weakness into a required B2B data-sharing partnership.
+
+================================================================================
+19. Project Roadmap: Built vs. Next Steps
+================================================================================
+
+PHASE 1: THE MVP FOUNDATION (COMPLETED)
+We have successfully built and mathematically verified the core intelligence and physics of the Digital Twin:
+1. The Physics Engine (twin_ref.py): A rigorously tested mathematical model of telecom power draw, tier-based degradation, and VRLA/LFP battery Peukert depletion.
+2. The Priority Lattice (Safety Arbiter): An unbreakable rules engine that mathematically guarantees physical hardware safety (Upper Bounds) always overrides AI QoS requests (Lower Bounds).
+3. The Synthetic Data Generator (data_generator.py): A robust simulator that accurately mimics Iranian telecom realities, including Thursday/Friday traffic curves, Bargh-e Man scheduled cuts, and +15% Wi-Fi fallback surges.
+4. The Traffic Forecaster (forecaster.py): A Quantile LightGBM AI model trained to predict the next-60-minute peak load, rigorously engineered to avoid the "Observer Effect" data leakage.
+5. The Simulation Controller (controller.py): The main event loop that ties the AI and physics together, proving a massive +145% gain in blackout survival time on degraded batteries.
+
+PHASE 2: THE PATH TO PRODUCTION (NEXT STEPS)
+To transition from a local simulation to an enterprise, Telco-Grade system controlling 10,000+ real towers, we must build the following:
+1. The Legacy Translator Microservice: An adapter that converts our standard "O-RAN Tier" decisions into the proprietary MML/CLI commands required by legacy Ericsson ENIQ and Huawei U2020 management systems.
+2. The Golang Orchestrator: Rewriting the central polling/execution loop in Go to handle high-concurrency network connections without crashing.
+3. Live Telemetry Pipeline (Kafka & TSDB): Replacing static CSV files with a live Apache Kafka streaming pipeline and a Time-Series Database (e.g., TimescaleDB) to ingest live network data.
+4. Bargh-e Man API Hook: Replacing simulated schedule flags with a live, automated scraper or API connection to national/regional Iranian power grid schedules.
+5. The Battery Anomaly AI: Training a second, distinct Machine Learning model purely on historical Battery Management System (BMS) data to detect sulfation and "sudden death" voltage drops before they happen.
+6. The Block-Conformal Calibrator: Wrapping the Traffic Forecaster in a dynamic mathematical calibrator to strictly guarantee the 95% QoS safety bound in real-time.

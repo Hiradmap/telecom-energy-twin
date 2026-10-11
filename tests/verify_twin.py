@@ -9,8 +9,13 @@ import numpy as np
 import pandas as pd
 import os
 
-sys.path.append(os.path.join(os.path.dirname(__file__), 'reference'))
-import twin_ref
+project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
+if os.path.dirname(__file__) not in sys.path:
+    sys.path.insert(0, os.path.dirname(__file__))
+
+from tests.reference import twin_ref
 
 rng = np.random.default_rng(7)
 LINE = "-" * 78
@@ -90,8 +95,10 @@ for soh in (1.0, 0.6, 0.4):
 
 # ------------------------------------------------------------------ T4 arbiter
 hdr("T4  Safety Arbiter Invariants (Priority Lattice: UB/LB clamp)")
+from arbiter_invariants import violations
+
 def check_arbiter(trials=10000):
-    bad = {"conflict_ub_wins": 0, "ub_fail": 0, "lb_fail": 0}
+    bad = {"conflict_ub_wins": 0, "invariants_violated": 0}
     for _ in range(trials):
         g = bool(rng.integers(0, 2))
         curr = int(rng.integers(0, 5))
@@ -114,8 +121,9 @@ def check_arbiter(trials=10000):
         )
         fin, why = twin_ref.arbitrate(inp)
         
-        if fin < 1 and not bh_down and fin != 0: 
-            bad["ub_fail"] += 1
+        viols = violations(inp, fin)
+        if viols:
+            bad["invariants_violated"] += len(viols)
         if "conflict:UB-wins" in why:
             bad["conflict_ub_wins"] += 1
             

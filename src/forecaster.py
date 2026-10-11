@@ -59,6 +59,26 @@ def engineer_features(df):
     
     return df, features
 
+TRAIN_FRAC = 0.7
+HORIZON_STEPS = 12   # next-60-min target; used as purge gap between train and test
+
+
+def split_by_site(df_feat, train_frac=TRAIN_FRAC, gap=HORIZON_STEPS):
+    """Chronological train/test split applied to EVERY site with the same calendar cut-off.
+
+    The previous split cut a site-sorted concatenated frame, so train held whole sites (and the same
+    dates as the 'test' site) and the controller later evaluated on data the model had been trained on.
+    Here: all sites share one cut-off timestamp; `gap` steps before it are purged so no training target
+    window overlaps the test period. Returns (train_df, test_df).
+    """
+    ts = df_feat["timestamp"].drop_duplicates().sort_values().reset_index(drop=True)
+    cut = ts.iloc[int(len(ts) * train_frac)]
+    purge_start = cut - pd.Timedelta(minutes=5 * gap)
+    train = df_feat[df_feat["timestamp"] < purge_start]
+    test = df_feat[df_feat["timestamp"] >= cut]
+    return train, test
+
+
 def train_and_evaluate():
     print("Loading synthetic dataset...")
     df = pd.read_csv("data/synthetic_telecom_data.csv", parse_dates=["timestamp"])
@@ -66,10 +86,8 @@ def train_and_evaluate():
     print("Engineering features...")
     df_feat, feature_cols = engineer_features(df)
     
-    # Chronological Split (Train: 70%, Test: 30%)
-    split_idx = int(len(df_feat) * 0.7)
-    train_df = df_feat.iloc[:split_idx]
-    test_df = df_feat.iloc[split_idx:]
+    # Per-site chronological split (same cut-off date for all sites, purge gap at the boundary)
+    train_df, test_df = split_by_site(df_feat)
     
     X_train = train_df[feature_cols]
     y_train = train_df["target_peak_60m"]
@@ -77,7 +95,8 @@ def train_and_evaluate():
     X_test = test_df[feature_cols]
     y_test = test_df["target_peak_60m"]
     
-    print(f"Training set: {len(train_df)} rows. Testing set: {len(test_df)} rows.")
+    print(f"Training set: {len(train_df)} rows (< {train_df['timestamp'].max()}). "
+          f"Testing set: {len(test_df)} rows (>= {test_df['timestamp'].min()}).")
     print("Training Quantile LightGBM (alpha=0.95)...")
     
     model = lgb.LGBMRegressor(
@@ -94,6 +113,14 @@ def train_and_evaluate():
     
     print("Evaluating...")
     preds = model.predict(X_test)
+    
+    # Fair baseline: profile-q95 per (weekday, hour-of-day), fit on the same training period
+    key = ["dow", "hour"]
+    prof = train_df.groupby(key)["target_peak_60m"].quantile(0.95).rename("profile_q95")
+    base_pred = test_df.join(prof, on=key)["profile_q95"].fillna(train_df["target_peak_60m"].quantile(0.95)).values
+    base_pinball = mean_pinball_loss(y_test, base_pred, alpha=0.95)
+    base_cov = np.mean(y_test.values <= base_pred)
+    print(f"Baseline profile-q95: pinball={base_pinball:.4f} coverage={base_cov:.4f}")
     
     # Metrics
     # Pinball Loss

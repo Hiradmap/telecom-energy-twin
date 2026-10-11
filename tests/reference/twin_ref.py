@@ -24,6 +24,8 @@ GSM_FULL = 0.55         # kW  GSM S222 (6 TRX @ ~90 W) [ASSUMP from 80-140 W/TRX
 GSM_MIN = 0.30          # kW  GSM S111 BCCH-only (3 TRX)            [ASSUMP]
 VENDOR_MS = 0.20        # vendor micro-sleep: active-carrier power reduced by MS*(1-L)
 KAPPA_OFF = 0.0         # outage power-off (RRU de-energised)
+WAKE_TAX_KW = 0.10 * (P0 + DELTA)  # 0.085 kW: +10% max power for first 5 min after wake (Sec. 11)
+RECTIFIER_EFF = 0.96    # Telecom rectifier efficiency: AC mains power = (P_dc + P_charge) / 0.96
 
 # Service tiers (index = order). n_lte = number of LTE carriers ON.
 #   0 OFF        : all radios off
@@ -40,20 +42,22 @@ def lte_on_power(L: float, ms: float = VENDOR_MS) -> float:
 
 
 def site_power_kw(tier: int, demand_cu: float, sleep_kappa: float, mode: str = "grid",
-                  ms: float = VENDOR_MS, n_waking: int = 0) -> float:
+                  ms: float = VENDOR_MS, n_waking: int = 0, n_waking_tax: int = 0) -> float:
     """demand_cu: LTE offered load in carrier-capacity units.
-    mode='grid': non-active LTE carriers are in ES_SLEEP (kappa); mode='outage': they are OFF."""
+    mode='grid': non-active LTE carriers are in ES_SLEEP (kappa); mode='outage': they are OFF.
+    n_waking: carriers currently powering up (draw idle power P0).
+    n_waking_tax: waking carriers within their first 5 minutes paying +10% max power signaling tax."""
     if tier == 0:
         return 0.0
     n_on = TIER_N_LTE[tier]
-    gsm = GSM_MIN if tier == 1 else GSM_FULL
+    gsm = GSM_MIN if (tier == 1 and mode == "outage") else GSM_FULL
     p = P_FIXED + gsm
     if n_on:
         L = min(1.0, demand_cu / n_on)
         p += n_on * lte_on_power(L, ms)
     n_idle = 3 - n_on
     k = sleep_kappa if mode == "grid" else KAPPA_OFF
-    p += n_waking * P0 + max(0, n_idle - n_waking) * P0 * k
+    p += n_waking * P0 + n_waking_tax * WAKE_TAX_KW + max(0, n_idle - n_waking) * P0 * k
     return p
 
 
@@ -129,6 +133,11 @@ class Battery:
         self.soc = max(0.0, self.soc - dq / self.C)
         self.ah_out += I * dt_s / 3600.0
         self.event_soc_min = min(self.event_soc_min, self.soc)
+        if self.soc <= 0.0:
+            # Bank is exhausted: terminal voltage collapses. Without this the clamped SOC left the
+            # open-circuit voltage above BLVD at low current, so a "dead" battery kept powering the
+            # site forever (free energy).
+            return min(V, self.c["v_blvd"] - 1.0)
         return V
 
     def charge(self, dt_s: float, ilim_C: float | None = None) -> float:
@@ -182,7 +191,7 @@ class CapacityEstimator:
 SLEEP_UTIL = 0.60       # sleep allowed if bound / n_target <= 0.60
 WAKE_UTIL = 0.70        # wake required if bound / n_current > 0.70 (hysteresis band 0.60-0.70)
 EMERG_UTIL = 0.85       # measured load per active carrier > 0.85 -> immediate wake
-SOC_CRIT = 0.35         # effective SOC critical (grid down) -> UB = SURVIVAL
+SOC_CRIT = 0.15         # effective SOC critical hard floor (grid down) -> UB = SURVIVAL
 T_CRIT = 50.0           # battery temperature critical -> UB = SURVIVAL
 DWELL_STEPS = 3         # 15 min between ES sleep actions (wakes never wait)
 STALE_MIN = 15.0
@@ -240,8 +249,11 @@ def arbitrate(x: ArbiterInput) -> tuple[int, list[str]]:
             if x.sleeps_left_today <= 0: gates.append("fatigue-budget")
             if gates:
                 LB = max(LB, x.current); why.append("LB:hold(" + ",".join(gates) + ")")
-            else:   # largest safe reduction: n_target must satisfy bound/n <= SLEEP_UTIL
-                n_safe = max(1, math.ceil(x.bound / SLEEP_UTIL - 1e-9))
+            else:   # largest safe reduction: n_target must satisfy max(forecast, measured)/n <= SLEEP_UTIL
+                # Using the measured load as well means a forecast miss can never talk the shield into
+                # sleeping capacity that is carrying traffic right now.
+                demand_ref = max(x.bound, x.measured)
+                n_safe = max(1, math.ceil(demand_ref / SLEEP_UTIL - 1e-9))
                 LB = max(LB, tier_for_lte(n_safe)); why.append("LB:capacity-clamp")
     else:
         LB = max(LB, 1); why.append("LB:survival-floor")   # outage: demand-based wakes do NOT apply
@@ -252,6 +264,12 @@ def arbitrate(x: ArbiterInput) -> tuple[int, list[str]]:
 
 
 # --------------------------------------------------------------------------- 5. outage planner
+def usable_energy_wh(batt: "Battery", soc_floor: float, v_nom: float = 48.0) -> float:
+    """Energy above `soc_floor` in Wh. SOC is a fraction of the AGED capacity (Ah_nom * SOH == batt.C),
+    never of the nameplate — using nameplate overstates worn batteries by 1/SOH."""
+    return max(0.0, (batt.soc - soc_floor) * batt.C * v_nom)
+
+
 def planner_tier(E_avail_wh_soft: float, E_avail_wh_hard: float, T_q50_h: float, T_q90_h: float,
                  P_tier_kw: list[float], margin: float = 0.10) -> int:
     """Receding-horizon reserve policy.

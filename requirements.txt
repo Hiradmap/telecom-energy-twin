@@ -18,5 +18,8 @@ hypothesis
 matplotlib
 plotly
 streamlit
+# Networking / Bargh-e Man SAAPA adapter
+requests
 # Exploration
 jupyterlab
+
