@@ -87,9 +87,9 @@ Summary of key corrections between v2.1 and v3:
 1.2 What the tests show (all synthetic — mechanisms, not field results)
 --------------------------------------------------------------------------------
 
-- Shedding load extends autonomy, but it cannot rescue dead batteries. Anchor-only (1.78 kW) vs all carriers (2.49 kW): about +40% uptime. At 60% battery health it turns a 2-hour cut from DOWN into UP; at 40% health nothing survives 2 h [TEST].
-- The ladder is a trade, not a free lunch: it buys ~16–19% more any-service hours but costs ~57–58% of full-service hours [TEST]. Say this out loud in the pitch.
-- Forecast+shield beats reactive thresholds only when waking is slow: with 15-min wake latency, reactive saves more energy (14.1%) but racks up 79 violation steps vs 12 for forecast+shield (9.2% saved) [TEST].
+- Shedding load extends autonomy across degraded battery health states. In closed-loop multi-seed benchmarks (`src/benchmark.py`, 9 unseen site-runs × 21 days), the Receding-Horizon Reserve Planner + Safety Arbiter extends 2h blackout survival from 74.3% to 100.0% (+34.3% autonomy) at 60% SOH, from 48.2% to 100.0% (+106.4%) at 40% SOH, and from 29.0% to 100.0% (+242.0% on the 2G voice layer) at 25% SOH; on 4h cuts at 25% SOH it extends survival from 16.3% to 76.1% (+363.5%, before physical BLVD exhaustion at 37.5 / 49.3h) [TEST].
+- The ladder is a transparent trade, not a free lunch: on fresh batteries (SOH 100%) during 2h cuts, it serves 27.4 CU·h of broadband traffic vs 30.0 CU·h for naive full-power while preserving battery reserve margins; on degraded batteries (SOH <= 60%), it sheds broadband capacity early to keep emergency voice/SMS alive across the entire cut [TEST]. Say this out loud in the pitch.
+- Forecast+shield beats reactive thresholds when hardware waking is non-instant: across 9 unseen 21-day site-runs at 15-min wake latency, reactive control causes 694 total QoS violations (77.1 ± 11.8 per run), static timer causes 151 (16.8 ± 6.6 per run), and Forecast + Conformal + Shield (`shield_conformal`) causes 45 (5.0 ± 3.0 per run, 15.4x fewer total violations and 17.2x fewer controller-induced violations above the 5-violation physical spike floor) while saving 3.23 ± 0.74% AC kWh [TEST].
 
 ================================================================================
 2. Where this happens: Iran (deployment reality)
@@ -422,17 +422,17 @@ It calculates Upper Bounds (UB) based on safety constraints and Lower Bounds (LB
 final = clamp(proposal, LB, UB). If LB > UB, UB (Safety) wins.
 
 Upper Bounds (Safety - local site agent):
-- Backhaul down -> UB = 0 (OFF)
-- Battery/Thermal Critical (e.g. SOC < 35%, T >= 50C) -> UB = 1 (SURVIVAL)
+- Backhaul down -> UB = 2 (BASIC — sheds capacity carriers without power-cycling anchor/voice layers off; see Section 8.10)
+- Battery/Thermal Critical (effective SOC < 15%, V < 45.0V, T >= 50C) or Lease Expired on Battery -> UB = 1 (SURVIVAL)
 
 Lower Bounds (Service - QoS):
-- Grid Up -> LB = 2 (BASIC anchor floor)
+- Grid Up -> LB = 2 (BASIC anchor floor), or LB = 4 (FULL) on Lease Expired (Dead-Man's Switch)
 - Forecast / Emergency Wake -> LB = required capacity tier
-- Hold gates (stale telemetry, dwell time, fatigue budget) -> LB = current state
+- Hold gates (stale telemetry > 15m, dwell time < 15m, fatigue budget exhausted) -> LB = current state
 - Grid Down -> LB = 1 (SURVIVAL floor)
 
 Invariant Violation Tests [TEST]:
-Randomized Arbiter states (trials=10000): conflict:UB-wins in 1713 cases. 0 UB or LB violations.
+Randomized Arbiter states (trials=10000): conflict:UB-wins in 1486 cases. 0 UB or LB violations.
 
 - Shield v2 (refined): 0 anchor-sleep violations, 0 capacity violations in 200,000 trials [TEST].
 
@@ -540,17 +540,18 @@ Architecture:
 - Simulated entities: Site, RF carriers, aggregated user demand, neighbors with feeder IDs, grid schedule, rectifier, battery bank (chemistry, SOH, Peukert exponent), shelter thermal node, fault injector, vendor micro-sleep baseline switch.
 - Outputs per step: timestamp, cell_id, operational_state, grid_status, prb_dl_percent, active_ue, active_carriers, sleeping_carriers, site_power_dc_kw, site_power_ac_kw, battery_soc_percent, battery_temp_c, shelter_temp_c, battery_current_a, soh, any_service, full_service, demand_surge_flag, shield_reason, energy_saved_kwh, rejected_load.
 
-Closed-loop policy comparison (30 synthetic days, vs baseline with no energy saving) [TEST]:
+Closed-loop policy comparison (9 unseen out-of-sample site-runs × 21 days, via `.venv/bin/python -m src.benchmark`) [TEST]:
 
 | Policy | Wake = 0 min | Wake = 5 min | Wake = 15 min |
 |:---|---:|---:|---:|
-| No energy saving | 0.0% saved / 0 viol | 0.0% saved / 0 viol | 0.0% saved / 0 viol |
-| Static timer (00:00–06:00) | 5.2% saved / 26 viol | 5.2% saved / 26 viol | 5.2% saved / 26 viol |
-| Reactive threshold | 14.1% saved / 2 viol | 14.1% saved / 28 viol | 14.1% saved / 79 viol |
-| Forecast + Shield | 9.2% saved / 0 viol | 9.2% saved / 4 viol | 9.2% saved / 12 viol |
+| No energy saving (`none`) | 0.00% saved / 5 total viol (0.6 ± 0.5/run) | 0.00% saved / 5 total viol (0.6 ± 0.5/run) | 0.00% saved / 5 total viol (0.6 ± 0.5/run) |
+| Static timer (`timer`, 00:00–06:00) | 2.15% saved / 145 total viol (16.1 ± 6.4/run) | 2.14% saved / 146 total viol (16.2 ± 6.5/run) | 2.13% saved / 151 total viol (16.8 ± 6.6/run) |
+| Reactive threshold (`reactive`) | 7.36% saved / 5 total viol (0.6 ± 0.5/run) | 6.81% saved / 225 total viol (25.0 ± 4.6/run) | 6.68% saved / 694 total viol (77.1 ± 11.8/run) |
+| Forecast + Shield (`shield`) | 3.57% saved / 5 total viol (0.6 ± 0.5/run) | 3.52% saved / 21 total viol (2.3 ± 1.6/run) | 3.41% saved / 51 total viol (5.7 ± 3.1/run) |
+| Forecast + Conformal + Shield (`shield_conformal`) | 3.39% saved / 5 total viol (0.6 ± 0.5/run) | 3.34% saved / 20 total viol (2.2 ± 1.4/run) | 3.23% saved / 45 total viol (5.0 ± 3.0/run) |
 
 Interpretation:
-The forecaster's true value is QoS-safe energy savings when hardware wake-up is slow, NOT simply squeezing out more kWh. When wake latency is 15 minutes, reactive control experiences 79 severe congestion steps, while forecast+shield suffers only 12. Because injected traffic spikes are random, no forecaster can predict 100% of them; a baseline rate of ~12 violations is irreducible.
+The forecaster's true value is QoS-safe energy savings when hardware wake-up is slow, NOT simply squeezing out more kWh. When wake latency is 15 minutes, reactive control experiences 694 severe congestion steps (77.1 ± 11.8 per 21-day run) and 636.9 state transitions, while Forecast + Conformal + Shield (`shield_conformal`) suffers only 45 total violation steps (5.0 ± 3.0 per run — 15.4x fewer total violations and 17.2x fewer controller-induced violations above the 5-violation always-on spike floor) with 4.4x fewer state transitions (144.4).
 
 ================================================================================
 11. Parameter Freeze v3.3
@@ -642,7 +643,7 @@ Updated in v3.3: SOC_CRIT aligned to 0.15 hard floor, Rectifier efficiency = 0.9
 ================================================================================
 
 Q1: Why not just use a simple time-of-day clock?
-A: In our closed-loop simulation, a static timer caused 26 severe QoS violation steps because it cannot anticipate holiday variations, demand surges, or irregular traffic spikes. Our forecast+shield architecture saved 9.2% energy with 0 to 12 violation steps depending on hardware wake latency, while actively managing blackout survival.
+A: In our multi-seed out-of-sample benchmark (`src/benchmark.py`, 9 unseen site-runs × 21 days), a static 00:00–06:00 timer caused 145–151 severe QoS violation steps while saving only 2.13–2.15% AC kWh because it cannot anticipate holiday variations, demand surges, or irregular traffic spikes. Meanwhile, a reactive threshold caused 694 violation steps at 15-min wake latency. Our Forecast + Conformal + Shield architecture saved 3.23–3.39% AC kWh with 0 controller-induced violations at 0-min wake latency (5 total = identical to Always-FULL physical spikes) and 15.4x fewer violations than reactive at 15-min wake latency, while actively managing blackout survival.
 
 Q2: Modern base station vendors already include energy-saving features. What is novel here?
 A: Vendors implement fast symbol-level and slot-level micro-sleep (e.g., Ericsson Micro Sleep Tx, saving ~15% radio power). Our solution operates at a higher architectural tier: it is carrier-level, forecast-driven, outage-aware, and O-RAN-aligned. It does not replace vendor micro-sleep; it stacks on top of it to manage macro carrier states and battery preservation.
@@ -832,19 +833,18 @@ Result: This turns a mathematical weakness into a required B2B data-sharing part
 19. Project Roadmap: Built vs. Next Steps
 ================================================================================
 
-PHASE 1: THE MVP FOUNDATION (COMPLETED)
-We have successfully built and mathematically verified the core intelligence and physics of the Digital Twin:
-1. The Physics Engine (twin_ref.py): A rigorously tested mathematical model of telecom power draw, tier-based degradation, and VRLA/LFP battery Peukert depletion.
-2. The Priority Lattice (Safety Arbiter): An unbreakable rules engine that mathematically guarantees physical hardware safety (Upper Bounds) always overrides AI QoS requests (Lower Bounds).
-3. The Synthetic Data Generator (data_generator.py): A robust simulator that accurately mimics Iranian telecom realities, including Thursday/Friday traffic curves, Bargh-e Man scheduled cuts, and +15% Wi-Fi fallback surges.
-4. The Traffic Forecaster (forecaster.py): A Quantile LightGBM AI model trained to predict the next-60-minute peak load, rigorously engineered to avoid the "Observer Effect" data leakage.
-5. The Simulation Controller (controller.py): The main event loop that ties the AI and physics together, proving a massive +145% gain in blackout survival time on degraded batteries.
+PHASE 1: THE MVP FOUNDATION (COMPLETED & VERIFIED — 515 AUTOMATED TESTS)
+We have built and mathematically verified the core intelligence, physics, calibration, and vendor translation of the Digital Twin:
+1. The Physics Engine (`tests/reference/twin_ref.py` & `src/carriers.py`): A rigorously tested mathematical model of telecom power draw, 5-tier degradation, explicit `CarrierBank` wake-latency state machine (+10% signaling tax), two-node shelter/battery thermal coupling, and VRLA/LFP battery Peukert depletion.
+2. The Priority Lattice Safety Arbiter (`tests/reference/twin_ref.py` & `tests/arbiter_invariants.py`): An unbreakable rules engine that mathematically guarantees physical hardware safety (Upper Bounds) always overrides AI QoS requests (Lower Bounds), including backhaul fate-sharing (`UB = 2` BASIC, debounced 15m), telemetry fail-static hold (> 15m), and lease-loss dead-man's switch (`LB = 4` on AC mains, `UB = 1` on battery).
+3. The Synthetic Data Generator & Bargh-e Man Adapter (`src/data_generator.py` & `src/grid_client.py`): A simulator and dual-mode (`mock` / `live`) SAAPA-schema client that mimics Iranian telecom realities, including Residential/Commercial/Highway archetypes, Thursday/Friday & Ramadan curves, Tavanir 2h scheduled blackout slots, and +15% Wi-Fi fallback surges.
+4. The Traffic Forecaster & Rolling Conformal Calibrator (`src/forecaster.py` & `src/conformal.py`): A Quantile LightGBM (`q95`) model paired with a causal rolling split-conformal calibrator (`label_delay_steps=12`, 7-day window, 4h circular buckets, Adaptive Conformal Inference, and raw-model drift alarm) that maintains ~95% empirical coverage even under +30% Ramadan and global level shifts.
+5. The Simulation Controller & Multi-Seed Benchmark (`src/controller.py` & `src/benchmark.py`): A vectorized closed-loop controller and reproducible out-of-sample benchmark suite proving +34% to +363.5% gains in blackout survival time on degraded batteries (`SOH` 60%–25%) and a 15.4x reduction in QoS violations vs. reactive thresholds at 15-min wake latency.
+6. The Vendor Translation Layer & Interactive NOC Dashboard (`src/translation_layer.py` & `src/dashboard.py`): A deterministic translation engine converting abstract tier transitions into validated Huawei MML, Ericsson CLI (`moshell`), and O-RAN O1 NETCONF XML scripts with verify/rollback commands, embedded inside a 4-tab Streamlit NOC command center.
 
-PHASE 2: THE PATH TO PRODUCTION (NEXT STEPS)
-To transition from a local simulation to an enterprise, Telco-Grade system controlling 10,000+ real towers, we must build the following:
-1. The Legacy Translator Microservice: An adapter that converts our standard "O-RAN Tier" decisions into the proprietary MML/CLI commands required by legacy Ericsson ENIQ and Huawei U2020 management systems.
-2. The Golang Orchestrator: Rewriting the central polling/execution loop in Go to handle high-concurrency network connections without crashing.
-3. Live Telemetry Pipeline (Kafka & TSDB): Replacing static CSV files with a live Apache Kafka streaming pipeline and a Time-Series Database (e.g., TimescaleDB) to ingest live network data.
-4. Bargh-e Man API Hook: Replacing simulated schedule flags with a live, automated scraper or API connection to national/regional Iranian power grid schedules.
-5. The Battery Anomaly AI: Training a second, distinct Machine Learning model purely on historical Battery Management System (BMS) data to detect sulfation and "sudden death" voltage drops before they happen.
-6. The Block-Conformal Calibrator: Wrapping the Traffic Forecaster in a dynamic mathematical calibrator to strictly guarantee the 95% QoS safety bound in real-time.
+PHASE 2: THE PATH TO PRODUCTION (NEXT STEPS FOR FIELD PILOT)
+To transition from an offline prototype to a live enterprise system controlling 10,000+ field towers, the remaining deployment steps are:
+1. Golang Edge Orchestrator: Deploying the high-concurrency Go agent with persistent SQLite telemetry spooling and lease renewal at the regional NOC.
+2. Live Telemetry Pipeline (Kafka & TSDB): Connecting live ENIQ / U2020 PM counter streams and rectifier SNMP traps to replace CSV batch ingestion.
+3. Live Bargh-e Man Credential Provisioning: Activating `BargheManClient(mode="live")` with operator-grade Tavanir/SAAPA API tokens.
+4. Battery Anomaly AI Pilot: Training a secondary survival/hazard model on 6 months of real field BMS voltage/temperature logs to predict sulfation-induced sudden voltage collapse ahead of time.

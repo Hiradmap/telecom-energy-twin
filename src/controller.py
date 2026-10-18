@@ -4,6 +4,9 @@ import lightgbm as lgb
 import os
 import sys
 import warnings
+from dataclasses import dataclass
+from functools import lru_cache
+from typing import Optional, Sequence
 
 # Suppress lightgbm feature name warnings
 warnings.filterwarnings("ignore", category=UserWarning)
@@ -13,76 +16,110 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from src.forecaster import engineer_features, split_by_site
 from src.grid_client import BargheManClient
 from src.thermal import ShelterThermalModel, ambient_temperature, T_WARN, T_CRIT
+from src.carriers import CarrierBank
+from src.conformal import ConformalConfig, rolling_conformal_margin
 from tests.reference import twin_ref
 
 BURST = 1.25   # sub-5-minute burst factor used in violation checks (Parameter Freeze)
 RECTIFIER_EFF = getattr(twin_ref, "RECTIFIER_EFF", 0.96)
 WAKE_TAX_KW = getattr(twin_ref, "WAKE_TAX_KW", 0.085)
 
+DATA_PATH = "data/synthetic_telecom_data.csv"
+MODEL_PATH = "models/lgbm_q95_forecaster.txt"
 
-def run_simulation(
+# Failure-handling constants (5-minute steps).
+BACKHAUL_DEBOUNCE_STEPS = 3   # backhaul must be down 15 min before capacity carriers are shed (flap filter)
+LEASE_TIMEOUT_STEPS = 3       # central lease lapses 15 min after the control link is lost (dead-man's switch)
+
+POLICIES = ("shield", "none", "timer", "reactive")
+
+
+@dataclass(frozen=True)
+class Fault:
+    """A failure-drill event on the *twin's* control path, in step indices of the simulated window
+    (start inclusive, end exclusive).
+
+    kind:
+      "telemetry_loss" - PM telemetry stops arriving (fail-static after 15 min of age).
+      "backhaul_down"  - transport to the site is down (debounced, then capacity carriers are shed).
+      "lease_loss"     - the central control link/lease is lost (dead-man's switch after 15 min).
+    """
+    kind: str
+    start: int
+    end: int
+
+    def __post_init__(self):
+        if self.kind not in ("telemetry_loss", "backhaul_down", "lease_loss"):
+            raise ValueError(f"unknown fault kind {self.kind!r}")
+        if self.start < 0 or self.end <= self.start:
+            raise ValueError("fault needs 0 <= start < end")
+
+
+def _fault_mask(faults: Optional[Sequence[Fault]], kind: str, n: int) -> np.ndarray:
+    m = np.zeros(n, dtype=bool)
+    for f in faults or ():
+        if f.kind == kind:
+            m[f.start:min(f.end, n)] = True
+    return m
+
+
+def _tier_from_load(x: float, util: float = 0.6) -> int:
+    n = max(1, min(3, int(np.ceil(x / util - 1e-9))))
+    return twin_ref.tier_for_lte(n)
+
+
+@lru_cache(maxsize=4)
+def _load_features(data_path: str, mtime: float):
+    df_full = pd.read_csv(data_path, parse_dates=["timestamp"])
+    df_feat, feature_cols = engineer_features(df_full)
+    return df_feat, feature_cols
+
+
+@lru_cache(maxsize=2)
+def _load_model(model_path: str, mtime: float):
+    return lgb.Booster(model_file=model_path)
+
+
+def simulate_site(
+    site_df: pd.DataFrame,
+    predicted_peaks: np.ndarray,
+    *,
     site_id="SITE_1",
-    days=30,
     wake_latency_min=5.0,
-    soh=None,
+    initial_soh=1.0,
     grid_client=None,
     ambient_c=None,
     init_shelter_c=25.0,
     init_batt_c=25.0,
-    outage_duration_h=None,
     return_history=False,
+    policy="shield",
+    bound_margin: Optional[np.ndarray] = None,
+    faults: Optional[Sequence[Fault]] = None,
+    backhaul_debounce_steps: int = BACKHAUL_DEBOUNCE_STEPS,
+    lease_timeout_steps: int = LEASE_TIMEOUT_STEPS,
 ):
-    print(f"--- Starting MVP Simulation Loop for {site_id} (up to {days} days, OUT-OF-SAMPLE window) ---")
+    """Closed-loop twin vs baseline on one site window.
 
-    # 1. Load Data & Engineer Features
-    data_path = "data/synthetic_telecom_data.csv"
-    if not os.path.exists(data_path):
-        print("Error: Synthetic data not found.")
-        return None
-
-    df_full = pd.read_csv(data_path, parse_dates=["timestamp"])
-    print("Pre-computing historical features for Forecaster...")
-    df_feat, feature_cols = engineer_features(df_full)
-
-    # Evaluate ONLY on the held-out test period (the forecaster never trained on it)
-    _, test_df = split_by_site(df_feat)
-    steps = int(days * 288)
-    site_df = test_df[test_df["site_id"] == site_id].iloc[:steps].copy().reset_index(drop=True)
-    days = len(site_df) / 288.0
-
-    # If custom outage_duration_h is requested, adjust scheduled blackout blocks in site_df
-    if outage_duration_h is not None:
-        target_steps = max(1, int(round(float(outage_duration_h) * 12)))
-        is_sched = site_df["blackout_schedule_flag"].values
-        starts = np.where((is_sched == 1) & (np.pad(is_sched[:-1], (1, 0), constant_values=0) == 0))[0]
-
-        for s_idx in starts:
-            orig_end = s_idx
-            while orig_end < len(site_df) and site_df.at[orig_end, "blackout_schedule_flag"] == 1:
-                orig_end += 1
-
-            new_end = min(s_idx + target_steps, len(site_df))
-            site_df.loc[s_idx:new_end - 1, "grid_status"] = 0
-            site_df.loc[s_idx:new_end - 1, "blackout_schedule_flag"] = 1
-            site_df.loc[s_idx:new_end - 1, "unscheduled_fault_flag"] = 0
-            if new_end < orig_end:
-                site_df.loc[new_end:orig_end - 1, "grid_status"] = 1
-                site_df.loc[new_end:orig_end - 1, "blackout_schedule_flag"] = 0
-
-        site_df["traffic_state_label"] = np.where(site_df["grid_status"] == 0, 5, 0)
-
-    # 2. Load Forecaster Model
-    model_path = "models/lgbm_q95_forecaster.txt"
-    if not os.path.exists(model_path):
-        print("Error: Forecaster model not found. Run src/forecaster.py first.")
-        return None
-    model = lgb.Booster(model_file=model_path)
-    # Batch inference (one call instead of one per 5-min step)
-    predicted_peaks = model.predict(site_df[feature_cols])
-    print(f"Test window: {site_df['timestamp'].iloc[0]} -> {site_df['timestamp'].iloc[-1]} ({days:.1f} days)")
+    `policy` only changes behaviour while the grid is UP (energy-saving mode); during an outage every
+    policy uses the receding-horizon planner + arbiter:
+      shield   - forecast bound -> proposal -> Safety Arbiter (the product)
+      none     - always FULL (no energy saving)
+      timer    - static night timer (tier 2 from 00:00-06:00, FULL otherwise), no arbiter
+      reactive - tier from the load measured *now* (util 0.6), no forecast, no arbiter
+    `bound_margin` (optional) is added to the forecaster's q95 (conformal calibration).
+    `faults` injects telemetry/backhaul/lease failures (shield policy only).
+    """
+    if policy not in POLICIES:
+        raise ValueError(f"policy must be one of {POLICIES}")
+    n_steps = len(site_df)
+    predicted_peaks = np.asarray(predicted_peaks, dtype=float)
+    if len(predicted_peaks) != n_steps:
+        raise ValueError("predicted_peaks must align with site_df rows")
+    margin_arr = np.zeros(n_steps) if bound_margin is None else np.asarray(bound_margin, dtype=float)
+    if len(margin_arr) != n_steps:
+        raise ValueError("bound_margin must align with site_df rows")
 
     # 3. Initialize Physical Twins & Thermal Models
-    initial_soh = float(soh) if soh is not None else site_df["battery_soh"].iloc[0]
     batt_base = twin_ref.Battery(chem="VRLA", soh=initial_soh, Ah_nom=200.0, soc=1.0, T=float(init_batt_c))
     batt_twin = twin_ref.Battery(chem="VRLA", soh=initial_soh, Ah_nom=200.0, soc=1.0, T=float(init_batt_c))
 
@@ -96,6 +133,17 @@ def run_simulation(
     if grid_client is None:
         grid_client = BargheManClient(mode="mock")
     sched_end_map = grid_client.build_schedule_map(site_df, site_id=site_id, dt_s=dt_s)
+
+    # Column views (avoids per-row pandas overhead in the hot loop)
+    ts_arr = list(site_df["timestamp"])
+    hour_arr = site_df["hour"].to_numpy(dtype=float)
+    grid_arr = site_df["grid_status"].to_numpy()
+    demand_arr = site_df["organic_load_cu"].to_numpy(dtype=float)
+    sched_flag_arr = site_df["blackout_schedule_flag"].to_numpy()
+
+    tele_loss = _fault_mask(faults, "telemetry_loss", n_steps)
+    bh_fault = _fault_mask(faults, "backhaul_down", n_steps)
+    lease_fault = _fault_mask(faults, "lease_loss", n_steps)
 
     # 4. Metrics Tracking
     metrics = {
@@ -132,6 +180,11 @@ def run_simulation(
         "thermal_crit_interventions": 0,
         "baseline_cal_damage": 0.0,
         "twin_cal_damage": 0.0,
+        "fail_static_steps": 0,
+        "backhaul_shed_steps": 0,
+        "lease_lock_steps": 0,
+        "twin_transitions": 0,
+        "twin_dropped_grid_cuh": 0.0,
     }
 
     current_tier_twin = 4
@@ -142,28 +195,33 @@ def run_simulation(
     v_batt_base = 54.0
     v_batt_twin = 54.0
 
-    # Carrier state tracking: 'active', 'waking', 'sleeping'
-    carrier_states = ["active", "active", "active"]
-    carrier_wake_rem = [0.0, 0.0, 0.0]
-    carrier_tax_rem = [0.0, 0.0, 0.0]
+    # Carrier state tracking (wake latency & signalling tax) lives in the shared CarrierBank.
+    bank = CarrierBank(wake_latency_min)
 
+    # Failure-handling state
+    tele_age_min = 0.0
+    last_good_bound = float(predicted_peaks[0] + margin_arr[0]) if n_steps else 0.0
+    bh_run = 0
+    lease_run = 0
+
+    p_base_ac = 0.0
+    p_twin_ac = 0.0
     history_rows = []
 
-    print("Running Event Loop (Ticking physics engine step-by-step)...")
-
-    for i, row in site_df.iterrows():
-        grid_up = bool(row["grid_status"] == 1)
-        actual_demand = row["organic_load_cu"]
+    for i in range(n_steps):
+        grid_up = bool(grid_arr[i] == 1)
+        actual_demand = demand_arr[i]
+        hour_i = hour_arr[i]
 
         # Calculate ambient temperature (user override or Iranian diurnal profile)
-        t_amb = float(ambient_c) if ambient_c is not None else ambient_temperature(row["hour"])
+        t_amb = float(ambient_c) if ambient_c is not None else ambient_temperature(hour_i)
 
         if not grid_up:
             metrics["outage_steps"] += 1
             metrics["outage_demand_cuh"] += actual_demand * dt_s / 3600.0
 
         # Reset hardware fatigue cap at midnight
-        if row["hour"] < 0.1 and i > 0 and site_df.iloc[i-1]["hour"] > 23.0:
+        if hour_i < 0.1 and i > 0 and hour_arr[i - 1] > 23.0:
             sleeps_left_today = 4
 
         # ==========================================
@@ -229,28 +287,55 @@ def run_simulation(
         # TWIN LOGIC (Forecaster -> Planner -> Shield)
         # ==========================================
 
-        # 1. AI Forecast (pre-computed in batch above)
-        predicted_peak = predicted_peaks[i]
+        # --- control-path health (telemetry age, debounced backhaul, lease)
+        if tele_loss[i]:
+            tele_age_min += dt_s / 60.0
+        else:
+            tele_age_min = 0.0
+        stale = tele_age_min > twin_ref.STALE_MIN
+        bh_run = bh_run + 1 if bh_fault[i] else 0
+        lease_run = lease_run + 1 if lease_fault[i] else 0
+        backhaul_eff = bh_run >= backhaul_debounce_steps and bh_run > 0
+        lease_ok = not (lease_run >= lease_timeout_steps and lease_run > 0)
+
+        # 1. AI Forecast (pre-computed in batch by the caller); conformal margin only widens the bound
+        if stale:
+            predicted_peak = last_good_bound            # cannot refresh the forecast without telemetry
+        else:
+            predicted_peak = float(predicted_peaks[i] + margin_arr[i])
+            last_good_bound = predicted_peak
 
         # 2. Propose Action
         if grid_up:
             # Energy Saver Mode
-            if predicted_peak <= 1.0:
-                proposal = 2
-            elif predicted_peak <= 2.0:
-                proposal = 3
+            if policy == "none":
+                proposal = 4
+            elif policy == "timer":
+                proposal = 2 if hour_i < 6 else 4
+            elif policy == "reactive":
+                proposal = _tier_from_load(actual_demand)
             else:
-                proposal = 4
+                if predicted_peak <= 1.0:
+                    proposal = 2
+                elif predicted_peak <= 2.0:
+                    proposal = 3
+                else:
+                    proposal = 4
 
-            # Emergency hardware override (bypass AI if actual surge happens now)
-            if actual_demand > twin_ref.TIER_N_LTE[proposal]:
-                proposal = 4
+                # Emergency hardware override (bypass AI if actual surge happens now)
+                if actual_demand > twin_ref.TIER_N_LTE[proposal]:
+                    proposal = 4
+
+                # Fail-static (Arch 8.10): stale telemetry -> freeze the last verified safe state
+                if stale:
+                    metrics["fail_static_steps"] += 1
+                    proposal = current_tier_twin
         else:
             # Outage Survival Mode (Receding-Horizon Planner)
-            end_ts = sched_end_map.get(i) or sched_end_map.get(row["timestamp"])
-            if row["blackout_schedule_flag"] == 1 and end_ts is not None:
+            end_ts = sched_end_map.get(i) or sched_end_map.get(ts_arr[i])
+            if sched_flag_arr[i] == 1 and end_ts is not None:
                 # Read published Bargh-e Man schedule window without peeking future grid_status
-                remaining_h = max(dt_s / 3600.0, (end_ts - row["timestamp"]).total_seconds() / 3600.0)
+                remaining_h = max(dt_s / 3600.0, (end_ts - ts_arr[i]).total_seconds() / 3600.0)
                 t_q50 = remaining_h
                 t_q90 = remaining_h * 1.1  # 10% safety margin
             else:
@@ -265,24 +350,32 @@ def run_simulation(
             proposal = twin_ref.planner_tier(E_soft, E_hard, t_q50, t_q90, P_tiers, 0.1)
 
         # 3. Arbitrate (Safety Shield / Priority Lattice with Thermal Coupling)
-        arb_inp = twin_ref.ArbiterInput(
-            grid_up=grid_up, current=current_tier_twin, proposal=proposal, bound=predicted_peak,
-            measured=actual_demand, telemetry_age_min=0.0, steps_since_sleep=steps_since_sleep,
-            sleeps_left_today=sleeps_left_today, lease_valid=True, backhaul_down=False,
-            v_batt=v_batt_twin, v_backstop=45.0, eff_soc=batt_twin.soc - 0.10, t_batt=batt_twin.T
-        )
-
-        final_tier, why = twin_ref.arbitrate(arb_inp)
+        if grid_up and policy != "shield":
+            # Naive comparison policies act without the shield.
+            final_tier, why = proposal, ["policy:no-shield"]
+        else:
+            arb_inp = twin_ref.ArbiterInput(
+                grid_up=grid_up, current=current_tier_twin, proposal=proposal, bound=predicted_peak,
+                measured=actual_demand, telemetry_age_min=tele_age_min, steps_since_sleep=steps_since_sleep,
+                sleeps_left_today=sleeps_left_today, lease_valid=lease_ok, backhaul_down=backhaul_eff,
+                v_batt=v_batt_twin, v_backstop=45.0, eff_soc=batt_twin.soc - 0.10, t_batt=batt_twin.T
+            )
+            final_tier, why = twin_ref.arbitrate(arb_inp)
         if final_tier != proposal:
             metrics["shield_interventions"] += 1
         if "conflict:UB-wins" in why:
             metrics["shield_ub_conflicts"] += 1
         if "UB:thermal-critical" in why:
             metrics["thermal_crit_interventions"] += 1
+        if "UB:backhaul-down" in why:
+            metrics["backhaul_shed_steps"] += 1
+        if "UB:lease-expired-on-battery" in why or "LB:lease-expired->all-on" in why:
+            metrics["lease_lock_steps"] += 1
 
         # Update hardware fatigue tracking
         if final_tier != current_tier_twin:
             steps_since_sleep = 0
+            metrics["twin_transitions"] += 1
             if final_tier < current_tier_twin:
                 sleeps_left_today -= 1
         else:
@@ -292,41 +385,11 @@ def run_simulation(
         # Carrier state management (Wake-Up Latency & Signaling Tax)
         if not grid_up and (site_dead_twin or v_batt_twin < batt_twin.c["v_blvd"]):
             site_dead_twin = True
-            carrier_states = ["sleeping", "sleeping", "sleeping"]
-            carrier_wake_rem = [0.0, 0.0, 0.0]
-            carrier_tax_rem = [0.0, 0.0, 0.0]
-            n_act = 0
-            n_waking = 0
-            n_tax = 0
-            active_tier_step = 0
+            view = bank.kill()
         else:
-            target_n = twin_ref.TIER_N_LTE[final_tier]
-
-            for c_idx in range(3):
-                if c_idx < target_n:
-                    if carrier_states[c_idx] == "sleeping":
-                        if wake_latency_min <= 0:
-                            carrier_states[c_idx] = "active"
-                            carrier_wake_rem[c_idx] = 0.0
-                        else:
-                            carrier_states[c_idx] = "waking"
-                            carrier_wake_rem[c_idx] = float(wake_latency_min)
-                        carrier_tax_rem[c_idx] = 5.0  # 5 minutes of +10% signaling tax
-                else:
-                    # Sleep/power down is instantaneous
-                    carrier_states[c_idx] = "sleeping"
-                    carrier_wake_rem[c_idx] = 0.0
-                    carrier_tax_rem[c_idx] = 0.0
-
-            n_act = sum(1 for s in carrier_states if s == "active")
-            n_waking = sum(1 for s in carrier_states if s == "waking")
-            n_tax = sum(1 for t in carrier_tax_rem if t > 0.0)
-            metrics["twin_wake_tax_kwh"] += (n_tax * WAKE_TAX_KW * dt_s) / 3600.0
-
-            if n_act >= 1:
-                active_tier_step = twin_ref.tier_for_lte(n_act)
-            else:
-                active_tier_step = 1 if final_tier >= 1 else 0
+            view = bank.command(final_tier)
+            metrics["twin_wake_tax_kwh"] += (view.n_tax * WAKE_TAX_KW * dt_s) / 3600.0
+        n_act, n_waking, n_tax, active_tier_step = view.n_act, view.n_waking, view.n_tax, view.active_tier
 
         # 4. Execute Twin Physics Simulation
         if grid_up:
@@ -389,25 +452,21 @@ def run_simulation(
         cap = n_act
         if grid_up and actual_demand * BURST > cap:
             metrics["twin_viol_grid"] += 1
+        if grid_up:
+            metrics["twin_dropped_grid_cuh"] += max(0.0, actual_demand - cap) * dt_s / 3600.0
         if not grid_up:
             served_t = min(actual_demand, cap) if active_tier_step > 0 else 0.0
             metrics["twin_served_outage_cuh"] += served_t * dt_s / 3600.0
             metrics["twin_dropped_load_cu"] += (actual_demand - served_t) * dt_s / 3600.0
 
         # Tick carrier timers forward by dt_s
-        for c_idx in range(3):
-            if carrier_tax_rem[c_idx] > 0:
-                carrier_tax_rem[c_idx] = max(0.0, carrier_tax_rem[c_idx] - (dt_s / 60.0))
-            if carrier_states[c_idx] == "waking":
-                carrier_wake_rem[c_idx] = max(0.0, carrier_wake_rem[c_idx] - (dt_s / 60.0))
-                if carrier_wake_rem[c_idx] == 0.0:
-                    carrier_states[c_idx] = "active"
+        bank.tick(dt_s)
 
         if return_history:
             history_rows.append({
-                "timestamp": row["timestamp"],
+                "timestamp": ts_arr[i],
                 "site_id": site_id,
-                "grid_status": int(row["grid_status"]),
+                "grid_status": int(grid_arr[i]),
                 "actual_demand": actual_demand,
                 "base_tier": tier_base,
                 "twin_tier": active_tier_step,
@@ -425,11 +484,22 @@ def run_simulation(
                 "p_twin_dc": p_twin_dc,
                 "shield_intervention": bool(final_tier != proposal),
                 "shield_why": ";".join(why) if (final_tier != proposal or "conflict:UB-wins" in why) else "",
+                "commanded_tier": final_tier,
+                "bound": predicted_peak,
+                "fail_static": bool(grid_up and stale),
+                "backhaul_shed": bool(backhaul_eff),
+                "lease_lost": bool(not lease_ok),
             })
 
     metrics["baseline_cal_damage"] = batt_base.cal_damage
     metrics["twin_cal_damage"] = batt_twin.cal_damage
 
+    if return_history:
+        return metrics, pd.DataFrame(history_rows)
+    return metrics
+
+
+def print_report(metrics, *, site_id, days, initial_soh, wake_latency_min, faults=None, conformal_on=False):
     # ==========================================
     # FINAL REPORTING
     # ==========================================
@@ -474,11 +544,109 @@ def run_simulation(
     print("\n [ SAFETY SHIELD DIAGNOSTICS ]")
     print(f"  Proposal overridden by shield: {metrics['shield_interventions']} steps "
           f"({metrics['shield_ub_conflicts']} were safety UB-over-LB conflicts)")
+    if faults or conformal_on:
+        print(f"  Conformal calibration: {'ON' if conformal_on else 'off'}")
+        print(f"  Failure drills: fail-static holds={metrics['fail_static_steps']}  "
+              f"backhaul-shed steps={metrics['backhaul_shed_steps']}  lease-lock steps={metrics['lease_lock_steps']}")
     print("█"*60 + "\n")
 
-    if return_history:
-        return metrics, pd.DataFrame(history_rows)
-    return metrics
+
+def run_simulation(
+    site_id="SITE_1",
+    days=30,
+    wake_latency_min=5.0,
+    soh=None,
+    grid_client=None,
+    ambient_c=None,
+    init_shelter_c=25.0,
+    init_batt_c=25.0,
+    outage_duration_h=None,
+    return_history=False,
+    policy="shield",
+    conformal=False,
+    faults=None,
+    verbose=True,
+    data_path=DATA_PATH,
+    model_path=MODEL_PATH,
+):
+    """Load the dataset + frozen forecaster, take the held-out test window of `site_id`, and simulate.
+
+    conformal: False | True (default ConformalConfig) | ConformalConfig - rolling conformal calibration of the
+               q95 bound (margin computed causally; the pool is warmed up with the site's pre-test history).
+    """
+    log = print if verbose else (lambda *a, **k: None)
+    log(f"--- Starting MVP Simulation Loop for {site_id} (up to {days} days, OUT-OF-SAMPLE window) ---")
+
+    # 1. Load Data & Engineer Features
+    if not os.path.exists(data_path):
+        log("Error: Synthetic data not found.")
+        return None
+    log("Pre-computing historical features for Forecaster...")
+    df_feat, feature_cols = _load_features(data_path, os.path.getmtime(data_path))
+
+    # Evaluate ONLY on the held-out test period (the forecaster never trained on it)
+    _, test_df = split_by_site(df_feat)
+    steps = int(days * 288)
+    site_df = test_df[test_df["site_id"] == site_id].iloc[:steps].copy().reset_index(drop=True)
+    days = len(site_df) / 288.0
+
+    # If custom outage_duration_h is requested, adjust scheduled blackout blocks in site_df
+    if outage_duration_h is not None:
+        target_steps = max(1, int(round(float(outage_duration_h) * 12)))
+        is_sched = site_df["blackout_schedule_flag"].values
+        starts = np.where((is_sched == 1) & (np.pad(is_sched[:-1], (1, 0), constant_values=0) == 0))[0]
+
+        for s_idx in starts:
+            orig_end = s_idx
+            while orig_end < len(site_df) and site_df.at[orig_end, "blackout_schedule_flag"] == 1:
+                orig_end += 1
+
+            new_end = min(s_idx + target_steps, len(site_df))
+            site_df.loc[s_idx:new_end - 1, "grid_status"] = 0
+            site_df.loc[s_idx:new_end - 1, "blackout_schedule_flag"] = 1
+            site_df.loc[s_idx:new_end - 1, "unscheduled_fault_flag"] = 0
+            if new_end < orig_end:
+                site_df.loc[new_end:orig_end - 1, "grid_status"] = 1
+                site_df.loc[new_end:orig_end - 1, "blackout_schedule_flag"] = 0
+
+        site_df["traffic_state_label"] = np.where(site_df["grid_status"] == 0, 5, 0)
+
+    # 2. Load Forecaster Model
+    if not os.path.exists(model_path):
+        log("Error: Forecaster model not found. Run src/forecaster.py first.")
+        return None
+    model = _load_model(model_path, os.path.getmtime(model_path))
+    # Batch inference (one call instead of one per 5-min step)
+    predicted_peaks = model.predict(site_df[feature_cols])
+    log(f"Test window: {site_df['timestamp'].iloc[0]} -> {site_df['timestamp'].iloc[-1]} ({days:.1f} days)")
+
+    bound_margin = None
+    if conformal:
+        cfg = conformal if isinstance(conformal, ConformalConfig) else ConformalConfig()
+        # Calibrate on the site's FULL history so the residual pool is warm at the start of the test window.
+        # Residual labels (the realised next-60-min peak) are observable 60 min later, so this stays causal.
+        site_full = df_feat[df_feat["site_id"] == site_id].sort_values("timestamp").reset_index(drop=True)
+        pred_full = model.predict(site_full[feature_cols])
+        margin_full = rolling_conformal_margin(site_full["target_peak_60m"].values, pred_full,
+                                               site_full["hour"].values, cfg)
+        margin_by_ts = pd.Series(margin_full, index=site_full["timestamp"])
+        bound_margin = margin_by_ts.reindex(site_df["timestamp"]).fillna(0.0).values
+
+    initial_soh = float(soh) if soh is not None else site_df["battery_soh"].iloc[0]
+
+    out = simulate_site(
+        site_df, predicted_peaks, site_id=site_id, wake_latency_min=wake_latency_min, initial_soh=initial_soh,
+        grid_client=grid_client, ambient_c=ambient_c, init_shelter_c=init_shelter_c, init_batt_c=init_batt_c,
+        return_history=return_history, policy=policy, bound_margin=bound_margin, faults=faults,
+    )
+    metrics = out[0] if return_history else out
+
+    if verbose:
+        log("Running Event Loop (Ticking physics engine step-by-step)...")
+        print_report(metrics, site_id=site_id, days=days, initial_soh=initial_soh,
+                     wake_latency_min=wake_latency_min, faults=faults, conformal_on=bool(conformal))
+
+    return out
 
 
 if __name__ == "__main__":

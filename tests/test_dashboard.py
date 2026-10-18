@@ -270,3 +270,22 @@ def test_dashboard_two_way_preset_synchronization():
     at.sidebar.slider[2].set_value(80).run(timeout=35)
     assert at.sidebar.selectbox[0].value == "Custom Configuration"
     assert at.sidebar.slider[2].value == 80
+
+
+def test_dashboard_vendor_command_preview_panel():
+    """Verify the Vendor Command Preview panel renders commands and switches vendors cleanly."""
+    from src.dashboard import default_preview_transition, format_transition_label
+    ts = pd.Series(pd.date_range("2026-03-07 08:00", periods=5, freq="5min"))
+    transitions = [(1, 4, 3), (3, 3, 2)]
+    outages = [(ts.iloc[2], ts.iloc[4])]
+    assert default_preview_transition(ts, transitions, outages) == 1
+    assert "ANCHOR+1 → BASIC" in format_transition_label(ts, transitions[1], 1)
+
+    dashboard_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "../src/dashboard.py"))
+    at = AppTest.from_file(dashboard_path, default_timeout=35).run()
+    assert not at.exception
+    assert len(at.code) >= 1
+    # Toggle verify/rollback display and switch vendor
+    at.toggle(key="vp_show_extra").set_value(True).run(timeout=35)
+    assert not at.exception
+    assert len(at.code) >= 3

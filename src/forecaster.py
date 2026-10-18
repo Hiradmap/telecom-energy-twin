@@ -129,18 +129,30 @@ def train_and_evaluate():
     # Empirical Coverage (Percentage of times the true peak was <= our prediction)
     coverage = np.mean(y_test <= preds)
     
-    print("\n--- Forecaster Results ---")
+    print("\n--- Forecaster Results (Raw Quantile LightGBM) ---")
     print(f"Target: Next-60-Minute Peak Load")
     print(f"Alpha Target: 0.95 (95% Safety Bound)")
     print(f"Pinball Loss: {pinball:.4f}")
-    print(f"Empirical Coverage: {coverage:.4f} ({coverage*100:.2f}%)")
-    
-    if coverage < 0.95:
-        print("\n⚠️ WARNING: Empirical coverage is below 95%.")
-        print("This means the AI is slightly under-predicting the peaks, which could lead to QoS violations.")
-        print("As per v3.3 spec, we will need to wrap this in an EnbPI/Block-Conformal calibrator in the final pipeline.")
-    else:
-        print("\n✅ SUCCESS: Empirical coverage meets or exceeds the 95% safety bound.")
+    print(f"Empirical Coverage (raw): {coverage:.4f} ({coverage*100:.2f}%)")
+
+    # Apply causal rolling split-conformal calibration (src/conformal.py) per site
+    from src.conformal import ConformalConfig, rolling_conformal_margin, coverage_by_regime
+    cfg = ConformalConfig()
+    cal_preds = np.empty_like(preds)
+    for sid, g_test in test_df.groupby("site_id"):
+        g_full = df_feat[df_feat["site_id"] == sid].sort_values("timestamp").reset_index(drop=True)
+        p_full = model.predict(g_full[feature_cols])
+        m_full = rolling_conformal_margin(g_full["target_peak_60m"].values, p_full, g_full["hour"].values, cfg)
+        m_series = pd.Series(m_full, index=g_full["timestamp"])
+        pos = test_df.index.get_indexer(g_test.index)
+        cal_preds[pos] = preds[pos] + m_series.reindex(g_test["timestamp"]).fillna(0.0).values
+
+    cal_pinball = mean_pinball_loss(y_test, cal_preds, alpha=0.95)
+    cal_cov = float(np.mean(y_test.values <= cal_preds))
+    print(f"Empirical Coverage (+conformal): {cal_cov:.4f} ({cal_cov*100:.2f}%), pinball={cal_pinball:.4f}")
+    regimes = coverage_by_regime(y_test.values, cal_preds, test_df["hour"].values, test_df["grid_status"].values)
+    for r_name, r_stats in regimes.items():
+        print(f"  [{r_name:<16}] n={r_stats['n']:>5}  cov={r_stats['coverage']:.3f}  mean_bound={r_stats['mean_bound']:.3f}")
         
     # Feature Importance
     importances = pd.DataFrame({

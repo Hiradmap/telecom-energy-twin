@@ -34,6 +34,47 @@ if project_root not in sys.path:
 from src.controller import run_simulation, RECTIFIER_EFF, WAKE_TAX_KW
 from src.grid_client import BargheManClient, TAVANIR_BLOCKS, BargheManNetworkError, BargheManAPIError
 from src.thermal import T_WARN, T_CRIT
+from src.translation_layer import (
+    VENDORS,
+    TIER_NAMES,
+    TranslationError,
+    translate,
+    translate_plan,
+    tier_transitions,
+    summarize_command_counts,
+)
+
+VENDOR_LABELS: dict[str, str] = {
+    "huawei_mml": "Huawei MML (U2000/MAE)",
+    "ericsson_cli": "Ericsson ENM CLI",
+    "oran_netconf": "O-RAN O1 NETCONF",
+}
+
+
+def default_preview_transition(
+    timestamps: pd.Series,
+    transitions: list[tuple[int, int, int]],
+    outage_intervals: list[tuple[Any, Any]],
+) -> int:
+    """Pick the first enforced-tier transition at or after the first outage start (else 0)."""
+    if not transitions or not outage_intervals or timestamps.empty:
+        return 0
+    first_outage_start = outage_intervals[0][0]
+    for idx, (step, _, _) in enumerate(transitions):
+        if 0 <= step < len(timestamps) and timestamps.iloc[step] >= first_outage_start:
+            return idx
+    return 0
+
+
+def format_transition_label(
+    timestamps: pd.Series,
+    transition: tuple[int, int, int],
+    idx: int,
+) -> str:
+    """Format a tier transition tuple (step, from_tier, to_tier) for the selectbox."""
+    step, t_from, t_to = transition
+    ts_str = str(timestamps.iloc[step])[:16] if 0 <= step < len(timestamps) else f"step {step}"
+    return f"#{idx + 1} · {ts_str} · {TIER_NAMES[t_from]} → {TIER_NAMES[t_to]}"
 
 
 # =============================================================================
@@ -1143,6 +1184,73 @@ def main():
                         st.json(outages[:3])
                 else:
                     st.info(f"No scheduled timetable blackouts found for {site_id}.")
+
+        # ---------------------------------------------------------------------
+        # Vendor Command Preview (dry-run output of src/translation_layer.py)
+        # ---------------------------------------------------------------------
+        with st.container(border=True):
+            st.markdown("##### :material/terminal: Vendor Command Preview")
+            st.caption(
+                "Illustrative dry-run output only: these vendor commands are never executed, and their syntax must be "
+                "validated against the operator's MOM / MML release before any field use."
+            )
+            transitions = tier_transitions(hist_df["twin_tier"])
+            if not transitions:
+                st.info("The enforced (arbiter) tier never changed in this window, so no vendor commands are generated.")
+            else:
+                pick1, pick2 = st.columns([1, 1.4])
+                with pick1:
+                    vp_vendor = st.segmented_control(
+                        "Vendor / target interface",
+                        options=list(VENDORS),
+                        format_func=lambda v: VENDOR_LABELS[v],
+                        default="huawei_mml",
+                        key="vp_vendor",
+                    )
+                    if vp_vendor is None:
+                        vp_vendor = "huawei_mml"
+                with pick2:
+                    vp_default = default_preview_transition(hist_df["timestamp"], transitions, outage_intervals)
+                    vp_idx = st.selectbox(
+                        "Tier transition",
+                        options=list(range(len(transitions))),
+                        index=vp_default,
+                        format_func=lambda i: format_transition_label(hist_df["timestamp"], transitions[i], i),
+                        key="vp_transition",
+                        help="Defaults to the first enforced-tier change after the first outage starts.",
+                    )
+                step, t_from, t_to = transitions[vp_idx]
+                try:
+                    vp_cmds = translate(
+                        site_id, t_from, t_to, vp_vendor, reason="safety_arbiter: enforced tier change (twin_tier)"
+                    )
+                except TranslationError as exc:
+                    vp_cmds = []
+                    st.error(f"Translation refused: {exc}")
+
+                if vp_cmds:
+                    lang = "xml" if vp_vendor == "oran_netconf" else "text"
+                    st.markdown(
+                        f"**{TIER_NAMES[t_from]} → {TIER_NAMES[t_to]}** · {len(vp_cmds)} ordered action(s) · "
+                        f"{'sleep (anchor locked last)' if t_to < t_from else 'wake (GSM, then anchor first)'}"
+                    )
+                    show_extra = st.toggle("Show read-back (verify) and rollback commands", value=False, key="vp_show_extra")
+                    for n, c in enumerate(vp_cmds, start=1):
+                        st.caption(f"{n}. {c.op.value} · {c.layer} · target `{c.target}`")
+                        st.code(c.command, language=lang, wrap_lines=True)
+                        if show_extra:
+                            st.caption("Read-back")
+                            st.code(c.verify, language=lang, wrap_lines=True)
+                            st.caption("Rollback")
+                            st.code(c.rollback, language=lang, wrap_lines=True)
+
+                counts = summarize_command_counts(translate_plan(site_id, hist_df["twin_tier"], vp_vendor))
+                row = counts.get(vp_vendor, {"commands": 0, "statements": 0})
+                st.caption(
+                    f"Whole run: {len(transitions)} tier change(s) → {row['commands']} {VENDOR_LABELS[vp_vendor]} "
+                    f"action(s) / {row['statements']} statement(s) (dry run)."
+                )
+
 
     st.caption("Developed for Cellular Network Energy Digital Twin v3.3 · Compliant with 3GPP TR 36.887 & IEEE 484 standards.")
 

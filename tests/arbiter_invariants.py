@@ -16,17 +16,26 @@ def violations(x: "T.ArbiterInput", fin: int) -> list[str]:
     ub_backhaul = x.backhaul_down
     ub_thermal = x.t_batt >= THERMAL_CRIT
     ub_battery = (not x.grid_up) and (x.v_batt < x.v_backstop or x.eff_soc < T.SOC_CRIT)
+    ub_lease_batt = (not x.grid_up) and (not x.lease_valid)
 
     if not (0 <= fin <= 4):
         return ["tier-out-of-range"]
-    if ub_backhaul and fin != 0:
-        bad.append("backhaul-down-not-off")
-    if not ub_backhaul and ub_thermal and fin > 1:
+    # ---- upper bounds (safety always wins)
+    if ub_backhaul and fin > 2:
+        bad.append("backhaul-down-capacity-carriers-active")
+    if ub_thermal and fin > 1:
         bad.append("thermal-critical-not-limited")
-    if not ub_backhaul and ub_battery and fin > 1:
+    if ub_battery and fin > 1:
         bad.append("battery-critical-not-limited")
+    if ub_lease_batt and fin > 1:
+        bad.append("lease-expired-on-battery-not-survival")
+    # ---- floors that no safety bound may breach
+    if (not x.grid_up) and fin < 1:
+        bad.append("survival-floor-violated")           # arbiter never powers a site off by itself
+    if x.grid_up and ub_backhaul and not (ub_thermal) and fin < 2:
+        bad.append("backhaul-took-site-below-anchor")   # fate-sharing sheds capacity, never the anchor
 
-    no_ub = not (ub_backhaul or ub_thermal or ub_battery)
+    no_ub = not (ub_backhaul or ub_thermal or ub_battery or ub_lease_batt)
     if no_ub and x.grid_up:
         if fin < 2:
             bad.append("anchor-floor-violated")
@@ -49,6 +58,5 @@ def violations(x: "T.ArbiterInput", fin: int) -> list[str]:
                 bad.append("sleep-into-forecast-overload")
             if n_fin == 0 or x.measured / n_fin > T.SLEEP_UTIL + 1e-9:
                 bad.append("sleep-into-measured-overload")
-    if no_ub and not x.grid_up and fin < 1:
-        bad.append("survival-floor-violated")
     return bad
+

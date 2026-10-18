@@ -227,7 +227,13 @@ def arbitrate(x: ArbiterInput) -> tuple[int, list[str]]:
     UB, LB = 4, 0
     # ---- upper bounds (safety; local site agent; never depend on telemetry freshness)
     if x.backhaul_down:
-        UB = min(UB, 0); why.append("UB:backhaul-down")
+        # Backhaul fate-sharing (Arch 8.10): capacity carriers must not stay active, but the anchor LTE carrier
+        # and the GSM voice layer are NOT powered off (a full power-cycle turns a short backhaul blip into a long
+        # cold-start outage). The controller debounces the raw backhaul flag before it reaches this input.
+        UB = min(UB, 2); why.append("UB:backhaul-down")
+    if not x.grid_up and not x.lease_valid:
+        # Dead-man's switch on battery (Roadmap 4): lock SURVIVAL, never all-on (all-on kills a degraded bank).
+        UB = min(UB, 1); why.append("UB:lease-expired-on-battery")
     if not x.grid_up and (x.v_batt < x.v_backstop or x.eff_soc < SOC_CRIT):
         UB = min(UB, 1); why.append("UB:battery-critical")
     if x.t_batt >= T_CRIT:

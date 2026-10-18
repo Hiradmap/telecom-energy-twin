@@ -235,3 +235,109 @@ def test_outage_duration_scaling_affects_blackout_steps_and_planner_reserve():
     assert m_3h["twin_any_srv_steps"] >= m_3h["baseline_any_srv_steps"]
 
 
+# ----------------------------------------------------------------------------- 6. CarrierBank & Failure Drills
+def test_carrier_bank_state_machine():
+    """Verify CarrierBank instant sleep, timed wake, signaling tax window, and kill()."""
+    from src.carriers import CarrierBank
+    with pytest.raises(ValueError):
+        CarrierBank(wake_latency_min=-1.0)
+
+    bank = CarrierBank(wake_latency_min=10.0)
+    # Sleep 2 capacity carriers immediately -> only 1 active (Tier 2)
+    v_sleep = bank.command(2)
+    assert (v_sleep.n_act, v_sleep.n_waking, v_sleep.n_tax, v_sleep.active_tier) == (1, 0, 0, 2)
+
+    # Command FULL (Tier 4): 2 carriers enter 'waking' for 10 min and pay tax for 5 min
+    v_wake0 = bank.command(4)
+    assert (v_wake0.n_act, v_wake0.n_waking, v_wake0.n_tax, v_wake0.active_tier) == (1, 2, 2, 2)
+
+    # After one 5-min tick: tax expires (0 left), wake has 5 min remaining
+    bank.tick(300)
+    v_wake1 = bank.command(4)
+    assert (v_wake1.n_act, v_wake1.n_waking, v_wake1.n_tax, v_wake1.active_tier) == (1, 2, 0, 2)
+
+    # After second 5-min tick: carriers finish waking -> 3 active (Tier 4)
+    bank.tick(300)
+    v_wake2 = bank.command(4)
+    assert (v_wake2.n_act, v_wake2.n_waking, v_wake2.n_tax, v_wake2.active_tier) == (3, 0, 0, 4)
+
+    # kill() powers everything down immediately
+    v_dead = bank.kill()
+    assert (v_dead.n_act, v_dead.n_waking, v_dead.n_tax, v_dead.active_tier) == (0, 0, 0, 0)
+
+
+def test_failure_drills_telemetry_backhaul_and_lease():
+    """Verify telemetry fail-static hold, backhaul 15-min debounce + BASIC cap, and dead-man's switch."""
+    from src.controller import Fault
+
+    with pytest.raises(ValueError):
+        Fault("invalid_kind", 0, 5)
+    with pytest.raises(ValueError):
+        Fault("telemetry_loss", 10, 5)
+
+    # 1. Short 2-step (10-min) backhaul blip must be filtered out by the 3-step (15-min) debounce
+    m_blip = run_simulation(
+        site_id="SITE_1", days=1, wake_latency_min=0.0,
+        faults=[Fault("backhaul_down", 10, 12)], verbose=False,
+    )
+    assert m_blip["backhaul_shed_steps"] == 0
+
+    # 2. Sustained backhaul outage (10 steps = 50 min) sheds capacity carriers to BASIC (Tier 2), never OFF (Tier 0)
+    m_bh, h_bh = run_simulation(
+        site_id="SITE_1", days=1, wake_latency_min=0.0,
+        faults=[Fault("backhaul_down", 20, 30)], return_history=True, verbose=False,
+    )
+    assert m_bh["backhaul_shed_steps"] == 8  # steps 22..29 (after 3-step debounce at 20, 21, 22)
+    shed_rows = h_bh.iloc[22:30]
+    assert (shed_rows["backhaul_shed"]).all()
+    assert (shed_rows[shed_rows["grid_status"] == 1]["commanded_tier"] == 2).all()
+
+    # 3. Telemetry loss (> 15 min = 3 steps) triggers fail-static hold on grid
+    m_tl, h_tl = run_simulation(
+        site_id="SITE_1", days=1, wake_latency_min=0.0,
+        faults=[Fault("telemetry_loss", 30, 42)], return_history=True, verbose=False,
+    )
+    assert m_tl["fail_static_steps"] > 0
+    assert h_tl.iloc[34:42]["fail_static"].any()
+
+    # 4. Dead-man's switch (lease_loss): forces Tier 4 on AC mains and Tier 1 (SURVIVAL) during an outage
+    _, h_base = run_simulation(site_id="SITE_1", days=3, wake_latency_min=0.0, return_history=True, verbose=False)
+    grid_idx = int(h_base.index[h_base["grid_status"] == 1][20])
+    out_indices = h_base.index[h_base["grid_status"] == 0].tolist()
+    assert len(out_indices) >= 6
+    out_start = int(out_indices[0])
+
+    m_lease, h_lease = run_simulation(
+        site_id="SITE_1", days=3, wake_latency_min=0.0, soh=0.9,
+        faults=[
+            Fault("lease_loss", grid_idx, grid_idx + 8),
+            Fault("lease_loss", out_start, out_start + 8),
+        ],
+        return_history=True, verbose=False,
+    )
+    assert m_lease["lease_lock_steps"] > 0
+    # On grid after lease timeout (3 steps), commanded_tier must be 4 (FULL)
+    grid_locked = h_lease.iloc[grid_idx + 3:grid_idx + 8]
+    assert (grid_locked[grid_locked["grid_status"] == 1]["commanded_tier"] == 4).all()
+    # On battery after lease timeout, commanded_tier must be 1 (SURVIVAL), never 4
+    out_locked = h_lease.iloc[out_start + 3:out_start + 8]
+    assert (out_locked[out_locked["grid_status"] == 0]["commanded_tier"] == 1).all()
+
+
+def test_conformal_and_policy_modes_in_controller():
+    """Verify run_simulation supports conformal=True and all comparison policies."""
+    m_conf, h_conf = run_simulation(
+        site_id="SITE_1", days=3, wake_latency_min=5.0, conformal=True, return_history=True, verbose=False
+    )
+    m_raw, h_raw = run_simulation(
+        site_id="SITE_1", days=3, wake_latency_min=5.0, conformal=False, return_history=True, verbose=False
+    )
+    # Conformal calibration only widens the bound (bound_conf >= bound_raw everywhere)
+    assert (h_conf["bound"].values >= h_raw["bound"].values - 1e-12).all()
+    assert m_conf["twin_viol_grid"] <= m_raw["twin_viol_grid"]
+
+    for pol in ("none", "timer", "reactive"):
+        m_pol = run_simulation(site_id="SITE_1", days=2, wake_latency_min=5.0, policy=pol, verbose=False)
+        assert m_pol["twin_ac_kwh"] > 0
+
+
