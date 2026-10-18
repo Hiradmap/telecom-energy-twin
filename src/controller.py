@@ -485,6 +485,8 @@ def simulate_site(
                 "shield_intervention": bool(final_tier != proposal),
                 "shield_why": ";".join(why) if (final_tier != proposal or "conflict:UB-wins" in why) else "",
                 "commanded_tier": final_tier,
+                "pred_q95": float(predicted_peaks[i]),
+                "conformal_margin": float(margin_arr[i]),
                 "bound": predicted_peak,
                 "fail_static": bool(grid_up and stale),
                 "backhaul_shed": bool(backhaul_eff),

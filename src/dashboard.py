@@ -125,6 +125,7 @@ def execute_simulation(
     init_ba: float,
     mode: str,
     outage_dur_h: float | None = None,
+    conformal_on: bool = True,
 ) -> tuple[dict[str, Any], pd.DataFrame] | None:
     """Executes digital twin physical simulation loop and returns metrics and full telemetry history."""
     g_client = BargheManClient(mode=mode)
@@ -139,6 +140,7 @@ def execute_simulation(
         init_batt_c=init_ba,
         outage_duration_h=outage_dur_h,
         return_history=True,
+        conformal=conformal_on,
     )
     return res
 
@@ -359,6 +361,16 @@ def render_power_timeseries(hist_df: pd.DataFrame, outage_intervals: list[tuple[
         ),
         secondary_y=True,
     )
+    if "bound" in sample_plot.columns:
+        fig_power.add_trace(
+            go.Scatter(
+                x=sample_plot["timestamp"], y=sample_plot["bound"],
+                name="AI 60m Safety Bound (q95 + Conformal)",
+                line=dict(color="#F59E0B", width=1.6, dash="dot"),
+                hovertemplate="%{y:.2f} CU<extra>AI Bound</extra>",
+            ),
+            secondary_y=True,
+        )
 
     # Shading for blackout intervals within selected sample window
     sample_start = sample_plot["timestamp"].iloc[0]
@@ -543,6 +555,13 @@ def main():
         )
         client_mode = grid_mode if grid_mode is not None else "mock"
 
+        conformal_on = st.toggle(
+            "Causal Conformal Calibration (q95 + ACI)",
+            value=True,
+            key="conformal_toggle",
+            help="Applies 7-day rolling split-conformal margin (12-step causal delay, 4h diurnal buckets) to LightGBM q95.",
+        )
+
         if st.button("Clear Cache & Recompute", icon=":material/refresh:", width="stretch"):
             st.cache_data.clear()
             st.rerun()
@@ -561,10 +580,12 @@ def main():
         f":orange-badge[Battery Health: {soh_pct}% SOH]" if soh_pct >= 50 else f":red-badge[Battery Health: {soh_pct}% SOH]"
     )
     grid_badge = ":green-badge[Grid Mode: MOCK TIMETABLE]" if client_mode == "mock" else ":blue-badge[Grid Mode: LIVE SAAPA API]"
+    conf_badge = ":green-badge[AI Calibrator: CONFORMAL ON]" if conformal_on else ":gray-badge[AI Calibrator: RAW q95]"
 
     st.markdown(
         f":blue-badge[Archetype: {site_id}] "
         f"{grid_badge} "
+        f"{conf_badge} "
         f"{health_badge} "
         f":purple-badge[Outage Duration: {outage_dur_choice:.1f}h] "
         f":gray-badge[Horizon: {sim_days} Days] "
@@ -585,6 +606,7 @@ def main():
             init_batt,
             client_mode,
             outage_dur_choice,
+            conformal_on,
         )
 
     if sim_result is None:
